@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<title>Gym Tracker</title>
+<!-- Официальный скрипт Telegram: даёт объект Telegram.WebApp (тема, CloudStorage, диалоги) -->
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+/* Цвета берутся из темы Telegram (светлая/тёмная подставляется сама). Вторые значения — запасные для браузера. */
+:root{--bg:var(--tg-theme-bg-color,#fff);--tx:var(--tg-theme-text-color,#111);--hint:var(--tg-theme-hint-color,#8a8a8e);
+--btn:var(--tg-theme-button-color,#2481cc);--btx:var(--tg-theme-button-text-color,#fff);
+--sec:var(--tg-theme-secondary-bg-color,#f0f0f3);--red:var(--tg-theme-destructive-text-color,#d33)}
+@media(prefers-color-scheme:dark){:root{--bg:var(--tg-theme-bg-color,#1c1c1e);--tx:var(--tg-theme-text-color,#f2f2f7);--sec:var(--tg-theme-secondary-bg-color,#2c2c2e)}}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+body{margin:0;background:var(--bg);color:var(--tx);font:16px/1.4 -apple-system,system-ui,"Segoe UI",sans-serif;
+padding:12px 12px calc(28px + env(safe-area-inset-bottom))}
+h1{font-size:22px;margin:4px 0 8px}
+.card{background:var(--sec);border-radius:12px;padding:12px;margin:8px 0}
+.row{display:flex;gap:8px;align-items:center}.sp{justify-content:space-between}
+button{font:inherit;border:0;border-radius:10px;padding:13px 14px;background:var(--btn);color:var(--btx);width:100%;margin:4px 0}
+button:active{opacity:.7}
+button.sec{background:var(--sec);color:var(--tx);text-align:left}
+button.red{background:transparent;color:var(--red)}
+button.sm{width:auto;padding:6px 12px;margin:0;text-align:center}
+input{font:inherit;width:100%;padding:12px;border-radius:10px;border:1px solid var(--hint);background:var(--bg);color:var(--tx)}
+.hint{color:var(--hint);font-size:14px}
+.bars{display:flex;align-items:flex-end;gap:4px;height:210px;padding-top:20px;margin:12px 0 4px}
+.bar{flex:1;background:var(--btn);border-radius:4px 4px 0 0;position:relative;min-width:6px}
+.bar b{position:absolute;top:-16px;left:50%;transform:translateX(-50%);font-size:10px;font-weight:400;white-space:nowrap}
+.nol b{display:none}
+</style>
+</head>
+<body>
+<div id="app" class="hint">Загрузка…</div>
+
+<script>
+/* =====================================================================
+   1. НАСТРОЙКИ — ЗДЕСЬ МОЖНО МЕНЯТЬ СПИСКИ УПРАЖНЕНИЙ
+   ===================================================================== */
+const BASE = {
+  upper: ['Жим лёжа','Жим гантелей на наклонной','Тяга верхнего блока','Тяга штанги в наклоне',
+          'Жим стоя','Подъём штанги на бицепс','Разгибания на трицепс'],      // <- ВЕРХ ТЕЛА: правьте/добавляйте свои
+  lower: ['Приседания со штангой','Румынская тяга','Жим ногами','Выпады с гантелями',
+          'Сгибания ног лёжа','Подъём на носки','Скручивания']                // <- НИЗ ТЕЛА
+};
+const T = {upper:'Верх тела', lower:'Низ тела'};
+
+/* =====================================================================
+   2. ХРАНИЛИЩЕ. Telegram CloudStorage (данные в облаке Telegram, привязаны к вашему аккаунту и боту).
+   Ключи: 'w_<время>' — одна завершённая тренировка (JSON), 'active' — незавершённая, 'custom' — свои упражнения.
+   Лимиты: 1024 ключа, значение до 4096 символов. Вне Telegram (для теста в браузере) работает localStorage.
+   ВАЖНО: метода deleteItem в Telegram нет — удаление делается через removeItem.
+   ===================================================================== */
+const tg = (window.Telegram && Telegram.WebApp) || {};
+const cloud = !!(tg.initData && tg.CloudStorage);
+if (tg.ready) { tg.ready(); tg.expand(); }
+const CS = tg.CloudStorage, LP = 'gymapp_';
+const st = {
+  get: k => new Promise(r => cloud ? CS.getItem(k, (e, v) => r(e ? null : v || null)) : r(localStorage.getItem(LP + k))),
+  set: (k, v) => new Promise(r => cloud ? CS.setItem(k, v, (e, ok) => r(!e && ok)) : (localStorage.setItem(LP + k, v), r(true))),
+  del: k => new Promise(r => cloud ? CS.removeItem(k, () => r()) : (localStorage.removeItem(LP + k), r())),
+  keys: () => new Promise(r => cloud ? CS.getKeys((e, ks) => r(e ? [] : ks)) :
+        r(Object.keys(localStorage).filter(k => k.startsWith(LP)).map(k => k.slice(LP.length)))),
+  many: async ks => { const o = {}; await Promise.all(ks.map(async k => o[k] = await st.get(k))); return o; }
+};
+const j = (s, d) => { try { return s ? JSON.parse(s) : d } catch (e) { return d } };
+const say = m => cloud && tg.showAlert ? tg.showAlert(m) : alert(m);
+const ask = (m, cb) => cloud && tg.showConfirm ? tg.showConfirm(m, ok => ok && cb()) : (confirm(m) && cb());
+
+/* =====================================================================
+   3. СОСТОЯНИЕ И ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+   Тренировка: {id:'w_<start>', type:'upper'|'lower', start, end, ex:{'Жим лёжа':[[вес,повторы],...]}}
+   ===================================================================== */
+const S = {view:'home', active:null, custom:{upper:[], lower:[]}, hist:[], ex:null, rep:null, fromHist:false};
+const $ = s => document.querySelector(s);
+const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const num = n => Math.round(n * 100) / 100;
+const fmt = n => num(n).toLocaleString('ru-RU');
+const date = t => new Date(t).toLocaleDateString('ru-RU', {day:'2-digit', month:'2-digit', year:'2-digit'});
+const time = t => new Date(t).toLocaleTimeString('ru-RU', {hour:'2-digit', minute:'2-digit'});
+const sets = w => Object.values(w.ex).flat();
+const tonOf = a => a.reduce((s, [w, r]) => s + w * r, 0);   // тоннаж = вес × повторы, сумма по подходам
+const ton = w => tonOf(sets(w));
+const maxW = a => Math.max(...a.map(s => s[0]));
+const list = t => [...BASE[t], ...S.custom[t]];
+const delta = (a, b) => { const x = a - b; return x ? (x > 0 ? '+' : '') + fmt(x) + (b ? ` (${x > 0 ? '+' : ''}${(x / b * 100).toFixed(1)}%)` : '') : 'без изменений'; };
+const save = () => st.set('active', JSON.stringify(S.active));   // черновик тренировки сохраняется после каждого изменения
+const go = v => { S.view = v; render(); scrollTo(0, 0); };
+
+async function loadAll() {   // читает все завершённые тренировки, новые — первыми
+  const ks = (await st.keys()).filter(k => k.startsWith('w_'));
+  const o = await st.many(ks);
+  S.hist = ks.map(k => j(o[k], null)).filter(Boolean).sort((a, b) => b.start - a.start);
+}
+const prevSets = n => { const h = S.hist.find(h => h.type === S.active.type && h.ex[n]); return h && [h.start, h.ex[n]]; };
+
+/* =====================================================================
+   4. ЭКРАНЫ (каждый возвращает HTML; кнопки помечены data-a="действие")
+   ===================================================================== */
+const V = {
+home: () => `<h1>💪 Gym Tracker</h1>
+ <button data-a="${S.active ? 'work' : 'pick'}">${S.active ? '▶️ Продолжить тренировку' : '🏋 Начать тренировку'}</button>
+ <button class="sec" data-a="hist">📜 История</button><button class="sec" data-a="prog">📈 Прогресс</button>
+ <button class="red" data-a="wipe">Удалить все данные</button>
+ ${cloud ? '' : '<p class="hint">Открыто вне Telegram: данные хранятся только в этом браузере.</p>'}`,
+
+pick: () => `<h1>Какая тренировка?</h1>
+ <button data-a="start" data-t="upper">💪 Верх тела</button><button data-a="start" data-t="lower">🦵 Низ тела</button>
+ <button class="sec" data-a="home">⬅️ Назад</button>`,
+
+work: () => { const a = S.active, t = a.type, own = S.custom[t];
+ const names = [...new Set([...list(t), ...Object.keys(a.ex)])];
+ return `<h1>${T[t]}</h1><div class="hint">Начало ${time(a.start)} · подходов ${sets(a).length} · тоннаж ${fmt(ton(a))} кг</div>
+ ${names.map(n => { const c = (a.ex[n] || []).length;
+   return `<div class="row"><button class="sec" data-a="ex" data-n="${esc(n)}">${c ? '✅ ' : ''}${esc(n)}${c ? ' (' + c + ')' : ''}</button>` +
+   (own.includes(n) ? `<button class="sm red" data-a="delex" data-n="${esc(n)}">✕</button>` : '') + '</div>'; }).join('')}
+ <div class="card"><div class="row"><input id="newex" placeholder="Своё упражнение" maxlength="60"><button class="sm" data-a="addex">＋</button></div></div>
+ <button data-a="finish">🏁 Завершить тренировку</button>
+ <button class="sec" data-a="home">🏠 Меню</button><button class="red" data-a="drop">Удалить эту тренировку</button>`; },
+
+ex: () => { const n = S.ex, s = S.active.ex[n] || [], p = prevSets(n), l = s[s.length - 1] || (p && p[1].at(-1)) || ['', ''];
+ return `<h1>${esc(n)}</h1>
+ ${p ? `<div class="hint">Прошлый раз (${date(p[0])}): ${p[1].map(([w, r]) => fmt(w) + '×' + r).join(' · ')}</div>` : ''}
+ ${s.map(([w, r], i) => `<div class="card row sp"><span>${i + 1}. <b>${fmt(w)}</b> кг × <b>${r}</b> = ${fmt(w * r)}</span>
+   <button class="sm red" data-a="delset" data-i="${i}">✕</button></div>`).join('')}
+ <div class="row" style="margin-top:12px"><input id="w" type="text" inputmode="decimal" placeholder="Вес, кг" value="${l[0]}">
+ <input id="r" type="text" inputmode="numeric" placeholder="Повторы" value="${l[1]}"></div>
+ <button data-a="addset">➕ Добавить подход</button><button class="sec" data-a="work">⬅️ К упражнениям</button>`; },
+
+report: () => { const w = S.rep, pr = S.hist.filter(h => h.type === w.type && h.start < w.start), p = pr[0], ss = sets(w);
+ // 🏆 — максимальный вес в упражнении выше, чем во всех прошлых тренировках этого типа
+ const rec = n => { const b = pr.filter(h => h.ex[n]).map(h => maxW(h.ex[n])); return b.length && maxW(w.ex[n]) > Math.max(...b) ? ' 🏆' : ''; };
+ const cmp = p ? `<div class="card"><b>Сравнение с ${date(p.start)}</b><br>Тоннаж: ${fmt(ton(w))} кг (${delta(ton(w), ton(p))})<br>
+   Подходы: ${ss.length} (${delta(ss.length, sets(p).length)})${Object.keys(w.ex).map(n => p.ex[n] ?
+   `<br>• ${esc(n)}: ${fmt(maxW(p.ex[n]))} → ${fmt(maxW(w.ex[n]))} кг (${delta(maxW(w.ex[n]), maxW(p.ex[n]))})` : '').join('')}</div>`
+   : '<div class="card hint">Прошлой тренировки такого типа ещё нет — сравнивать не с чем.</div>';
+ return `<h1>${S.fromHist ? 'Тренировка' : '🏁 Тренировка завершена'}</h1>
+ <div class="hint">${date(w.start)} ${time(w.start)} · ${T[w.type]} · ${Math.max(1, Math.round((w.end - w.start) / 60000))} мин</div>
+ ${Object.entries(w.ex).map(([n, s]) => `<div class="card"><b>${esc(n)}</b>${rec(n)} — ${fmt(tonOf(s))} кг<br>
+   <span class="hint">${s.map(([x, y]) => fmt(x) + '×' + y).join(' · ')}</span></div>`).join('')}
+ <div class="card">Σ Тоннаж: <b>${fmt(ton(w))} кг</b><br>Σ Подходов: <b>${ss.length}</b></div>${cmp}
+ <button class="sec" data-a="hist">📜 История</button><button class="sec" data-a="home">🏠 Меню</button>
+ <button class="red" data-a="delw">Удалить эту тренировку</button>`; },
+
+hist: () => `<h1>📜 История</h1>${S.hist.length ? S.hist.map((h, i) =>
+ `<button class="sec" data-a="open" data-i="${i}">${date(h.start)} · ${T[h.type]} · ${fmt(ton(h))} кг · ${sets(h).length} подх.</button>`).join('')
+ : '<p class="hint">Пока пусто. Завершите первую тренировку.</p>'}<button class="sec" data-a="home">🏠 Меню</button>`,
+
+prog: () => { const c = {}; S.hist.forEach(h => Object.keys(h.ex).forEach(n => c[n] = (c[n] || 0) + 1)); const ns = Object.keys(c);
+ return `<h1>📈 Прогресс</h1>${ns.length ? ns.map(n => `<button class="sec" data-a="chart" data-n="${esc(n)}">${esc(n)} · ${c[n]}</button>`).join('')
+ : '<p class="hint">Пока нет данных — завершите хотя бы одну тренировку.</p>'}<button class="sec" data-a="home">🏠 Меню</button>`; },
+
+chart: () => { const n = S.ex, all = S.hist.filter(h => h.ex[n]).reverse(), pts = all.slice(-20).map(h => [h.start, maxW(h.ex[n])]);
+ const m = Math.max(...pts.map(p => p[1])), f = pts[0], l = pts[pts.length - 1];
+ return `<h1>${esc(n)}</h1><div class="hint">Максимальный вес за тренировку, кг (последние ${pts.length})</div>
+ <div class="bars ${pts.length > 12 ? 'nol' : ''}">${pts.map(([t, v]) => `<div class="bar" style="height:${Math.max(v / m * 100, 3)}%"><b>${fmt(v)}</b></div>`).join('')}</div>
+ <div class="row sp hint"><span>${date(f[0])}</span><span>${date(l[0])}</span></div>
+ <div class="card">Рекорд: <b>${fmt(m)} кг</b><br>Тренировок с упражнением: ${all.length}<br>Первая → последняя: ${fmt(f[1])} → ${fmt(l[1])} кг</div>
+ <button class="sec" data-a="prog">⬅️ Назад</button>`; }
+};
+const render = () => { $('#app').innerHTML = V[S.view](); };
+
+/* =====================================================================
+   5. ДЕЙСТВИЯ КНОПОК
+   ===================================================================== */
+const A = {
+ home: () => go('home'), pick: () => go('pick'), work: () => go('work'), hist: () => go('hist'), prog: () => go('prog'),
+ start: d => { S.active = {type: d.t, start: Date.now(), ex: {}}; save(); go('work'); },
+ ex: d => { S.ex = d.n; go('ex'); },
+ addex: () => { const n = $('#newex').value.trim().slice(0, 60); if (!n) return;
+   const t = S.active.type, old = list(t).find(x => x.toLowerCase() === n.toLowerCase());
+   if (!old) { S.custom[t].push(n); st.set('custom', JSON.stringify(S.custom)); }
+   S.ex = old || n; go('ex'); },
+ delex: d => ask(`Убрать «${d.n}» из своих упражнений? Сохранённая история не изменится.`, () => {
+   const t = S.active.type; S.custom[t] = S.custom[t].filter(x => x !== d.n); st.set('custom', JSON.stringify(S.custom)); render(); }),
+ addset: () => {
+   const w = parseFloat($('#w').value.replace(',', '.')), r = parseInt($('#r').value, 10);
+   if (!(w >= 0 && w <= 1000) || !(r >= 1 && r <= 1000)) return say('Введите вес (0–1000 кг) и повторы (1–1000).');
+   (S.active.ex[S.ex] = S.active.ex[S.ex] || []).push([num(w), r]); save(); render(); },
+ delset: d => ask('Удалить этот подход?', () => { const a = S.active.ex[S.ex]; a.splice(+d.i, 1);
+   if (!a.length) delete S.active.ex[S.ex]; save(); render(); }),
+ drop: () => ask('Удалить текущую тренировку со всеми подходами?', () => { S.active = null; st.del('active'); go('home'); }),
+ finish: () => {
+   if (!sets(S.active).length) return say('Добавьте хотя бы один подход.');
+   ask('Завершить и сохранить тренировку?', async () => {
+     const w = {id: 'w_' + S.active.start, type: S.active.type, start: S.active.start, end: Date.now(), ex: S.active.ex};
+     const js = JSON.stringify(w);
+     if (js.length > 4000) return say('Тренировка слишком большая для одного ключа (лимит 4096 символов).');
+     if (!await st.set(w.id, js)) return say('Не удалось сохранить в CloudStorage. Попробуйте ещё раз.');
+     await st.del('active'); S.active = null; await loadAll();
+     S.rep = w; S.fromHist = false; go('report'); }); },
+ open: d => { S.rep = S.hist[+d.i]; S.fromHist = true; go('report'); },
+ delw: () => ask('Удалить эту тренировку из истории безвозвратно?', async () => { await st.del(S.rep.id); await loadAll(); go('hist'); }),
+ chart: d => { S.ex = d.n; go('chart'); },
+ wipe: () => ask('Удалить ВСЕ данные (тренировки, историю, свои упражнения)?', () => ask('Точно? Это нельзя отменить!', async () => {
+   for (const k of await st.keys()) await st.del(k);
+   S.active = null; S.hist = []; S.custom = {upper: [], lower: []}; go('home'); }))
+};
+document.addEventListener('click', e => { const b = e.target.closest('[data-a]'); if (b) A[b.dataset.a](b.dataset); });
+
+/* =====================================================================
+   6. ЗАПУСК: читаем сохранённое и показываем главный экран
+   ===================================================================== */
+(async () => {
+  S.active = j(await st.get('active'), null);
+  S.custom = Object.assign({upper: [], lower: []}, j(await st.get('custom'), {}));
+  await loadAll(); render();
+})();
+</script>
+</body>
+</html>
